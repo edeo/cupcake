@@ -1,0 +1,492 @@
+Here's a complete step-by-step guide to implement environment variables and CI/CD for your Python Lambda project:
+
+## Step 1: Project Structure Setup
+
+Create your project directory structure:
+
+```bash
+mkdir my-lambda-project
+cd my-lambda-project
+
+# Create the following structure:
+touch lambda_function.py
+touch data_processor.py
+touch config.py
+touch requirements.txt
+touch .env
+touch .gitlab-ci.yml
+mkdir tests
+mkdir data
+mkdir output
+touch tests/test_data_processor.py
+```
+
+## Step 2: Create Configuration Management
+
+**config.py:**
+```python
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file (for local development)
+load_dotenv()
+
+class Config:
+    def __init__(self):
+        # Detect if running on Lambda
+        self.is_lambda = os.environ.get('AWS_LAMBDA_FUNCTION_NAME') is not None
+        
+        # Environment-specific settings
+        if self.is_lambda:
+            # Lambda environment variables (set in AWS Lambda console)
+            self.input_bucket = os.environ.get('INPUT_BUCKET')
+            self.output_bucket = os.environ.get('OUTPUT_BUCKET')
+            self.environment = os.environ.get('ENVIRONMENT', 'production')
+            self.use_s3 = True
+        else:
+            # Local environment variables (from .env file)
+            self.input_path = os.environ.get('LOCAL_INPUT_PATH', './data/')
+            self.output_path = os.environ.get('LOCAL_OUTPUT_PATH', './output/')
+            self.environment = os.environ.get('ENVIRONMENT', 'development')
+            self.use_s3 = False
+        
+        # Common settings
+        self.log_level = os.environ.get('LOG_LEVEL', 'INFO')
+        
+    def validate(self):
+        """Validate required environment variables"""
+        if self.is_lambda:
+            if not self.input_bucket or not self.output_bucket:
+                raise ValueError("INPUT_BUCKET and OUTPUT_BUCKET must be set in Lambda environment")
+        return True
+```
+
+## Step 3: Create Environment Variables File
+
+**.env (for local development):**
+```bash
+# Local development settings
+LOCAL_INPUT_PATH=./data/
+LOCAL_OUTPUT_PATH=./output/
+ENVIRONMENT=development
+LOG_LEVEL=DEBUG
+
+# AWS credentials (optional - use AWS CLI profile instead)
+# AWS_ACCESS_KEY_ID=your_access_key
+# AWS_SECRET_ACCESS_KEY=your_secret_key
+# AWS_DEFAULT_REGION=us-east-1
+```
+
+## Step 4: Create File Handler with S3/Local Abstraction
+
+**data_processor.py:**
+```python
+import boto3
+import pandas as pd
+import logging
+from pathlib import Path
+import os
+
+logger = logging.getLogger(__name__)
+
+class FileHandler:
+    def __init__(self, config):
+        self.config = config
+        if config.use_s3:
+            self.s3 = boto3.client('s3')
+    
+    def read_csv(self, file_path):
+        """Read CSV from S3 or local filesystem"""
+        try:
+            if self.config.use_s3:
+                logger.info(f"Reading from S3: {self.config.input_bucket}/{file_path}")
+                obj = self.s3.get_object(Bucket=self.config.input_bucket, Key=file_path)
+                return pd.read_csv(obj['Body'])
+            else:
+                full_path = os.path.join(self.config.input_path, file_path)
+                logger.info(f"Reading from local: {full_path}")
+                return pd.read_csv(full_path)
+        except Exception as e:
+            logger.error(f"Error reading file {file_path}: {str(e)}")
+            raise
+    
+    def write_csv(self, df, file_path):
+        """Write CSV to S3 or local filesystem"""
+        try:
+            if self.config.use_s3:
+                logger.info(f"Writing to S3: {self.config.output_bucket}/{file_path}")
+                csv_buffer = df.to_csv(index=False)
+                self.s3.put_object(
+                    Bucket=self.config.output_bucket, 
+                    Key=file_path, 
+                    Body=csv_buffer
+                )
+            else:
+                full_path = os.path.join(self.config.output_path, file_path)
+                Path(full_path).parent.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Writing to local: {full_path}")
+                df.to_csv(full_path, index=False)
+        except Exception as e:
+            logger.error(f"Error writing file {file_path}: {str(e)}")
+            raise
+
+def process_data(config):
+    """Main data processing function"""
+    config.validate()
+    
+    # Set up logging
+    logging.basicConfig(
+        level=getattr(logging, config.log_level),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    file_handler = FileHandler(config)
+    
+    # Example processing logic
+    logger.info("Starting data processing...")
+    
+    # Read input files
+    df1 = file_handler.read_csv('input_file1.csv')
+    df2 = file_handler.read_csv('input_file2.csv')
+    
+    # Transform data (your logic here)
+    result_df = pd.merge(df1, df2, on='common_column', how='inner')
+    result_df['processed_at'] = pd.Timestamp.now()
+    
+    # Write output
+    file_handler.write_csv(result_df, 'reconciled_output.csv')
+    
+    logger.info(f"Processing complete. Processed {len(result_df)} records.")
+    return {
+        'records_processed': len(result_df),
+        'environment': config.environment
+    }
+```
+
+## Step 5: Create Lambda Handler
+
+**lambda_function.py:**
+```python
+import json
+import logging
+from config import Config
+from data_processor import process_data
+
+# Set up logging for Lambda
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def lambda_handler(event, context):
+    """AWS Lambda handler function"""
+    try:
+        config = Config()
+        result = process_data(config)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Processing completed successfully',
+                'result': result
+            })
+        }
+    except Exception as e:
+        logger.error(f"Lambda execution failed: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'message': 'Processing failed',
+                'error': str(e)
+            })
+        }
+
+# For local testing
+if __name__ == "__main__":
+    print("Running locally...")
+    config = Config()
+    result = process_data(config)
+    print(f"Result: {result}")
+```
+
+## Step 6: Create Requirements Files
+
+**requirements.txt:**
+```
+pandas==2.0.3
+boto3==1.28.57
+python-dotenv==1.0.0
+```
+
+**dev-requirements.txt:**
+```
+pytest==7.4.2
+moto==4.2.8  # For mocking AWS services in tests
+black==23.7.0  # Code formatter
+flake8==6.0.0  # Linter
+```
+
+## Step 7: Create Tests
+
+**tests/test_data_processor.py:**
+```python
+import pytest
+import pandas as pd
+from unittest.mock import patch, MagicMock
+from data_processor import process_data, FileHandler
+from config import Config
+
+class TestDataProcessor:
+    def test_local_file_handler(self):
+        # Mock config for local testing
+        config = MagicMock()
+        config.use_s3 = False
+        config.input_path = './test_data/'
+        config.output_path = './test_output/'
+        config.log_level = 'INFO'
+        
+        handler = FileHandler(config)
+        assert handler.config.use_s3 == False
+    
+    @patch('boto3.client')
+    def test_s3_file_handler(self, mock_boto):
+        # Mock config for S3 testing
+        config = MagicMock()
+        config.use_s3 = True
+        config.input_bucket = 'test-input-bucket'
+        config.output_bucket = 'test-output-bucket'
+        
+        handler = FileHandler(config)
+        assert handler.config.use_s3 == True
+        mock_boto.assert_called_once_with('s3')
+```
+
+## Step 8: Set up GitLab CI/CD
+
+**.gitlab-ci.yml:**
+```yaml
+variables:
+  PYTHON_VERSION: "3.9"
+
+stages:
+  - test
+  - build
+  - deploy
+
+# Test stage - runs on every commit
+test:
+  stage: test
+  image: python:${PYTHON_VERSION}
+  before_script:
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - pip install -r dev-requirements.txt
+  script:
+    - black --check .
+    - flake8 . --max-line-length=88
+    - pytest tests/ -v
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+
+# Build stage - create deployment package
+build:
+  stage: build
+  image: python:${PYTHON_VERSION}
+  before_script:
+    - pip install --upgrade pip
+  script:
+    - pip install -r requirements.txt -t .
+    - zip -r deployment-package.zip . -x "*.git*" "tests/*" "dev-requirements.txt" ".env" "data/*" "output/*"
+  artifacts:
+    paths:
+      - deployment-package.zip
+    expire_in: 1 hour
+  only:
+    - main
+    - develop
+
+# Deploy to development
+deploy_dev:
+  stage: deploy
+  image: amazon/aws-cli:latest
+  dependencies:
+    - build
+  script:
+    - aws lambda update-function-code 
+        --function-name ${DEV_LAMBDA_FUNCTION_NAME} 
+        --zip-file fileb://deployment-package.zip
+    - aws lambda update-function-configuration 
+        --function-name ${DEV_LAMBDA_FUNCTION_NAME}
+        --environment "Variables={INPUT_BUCKET=${DEV_INPUT_BUCKET},OUTPUT_BUCKET=${DEV_OUTPUT_BUCKET},ENVIRONMENT=development,LOG_LEVEL=DEBUG}"
+  only:
+    - develop
+  environment:
+    name: development
+
+# Deploy to production
+deploy_prod:
+  stage: deploy
+  image: amazon/aws-cli:latest
+  dependencies:
+    - build
+  script:
+    - aws lambda update-function-code 
+        --function-name ${PROD_LAMBDA_FUNCTION_NAME} 
+        --zip-file fileb://deployment-package.zip
+    - aws lambda update-function-configuration 
+        --function-name ${PROD_LAMBDA_FUNCTION_NAME}
+        --environment "Variables={INPUT_BUCKET=${PROD_INPUT_BUCKET},OUTPUT_BUCKET=${PROD_OUTPUT_BUCKET},ENVIRONMENT=production,LOG_LEVEL=INFO}"
+  only:
+    - main
+  when: manual  # Requires manual approval for production
+  environment:
+    name: production
+```
+
+## Step 9: Configure GitLab CI/CD Variables
+
+In your GitLab project, go to **Settings > CI/CD > Variables** and add:
+
+```
+# AWS Credentials
+AWS_ACCESS_KEY_ID = your_access_key_id
+AWS_SECRET_ACCESS_KEY = your_secret_access_key
+AWS_DEFAULT_REGION = us-east-1
+
+# Development Environment
+DEV_LAMBDA_FUNCTION_NAME = my-lambda-dev
+DEV_INPUT_BUCKET = my-input-bucket-dev
+DEV_OUTPUT_BUCKET = my-output-bucket-dev
+
+# Production Environment
+PROD_LAMBDA_FUNCTION_NAME = my-lambda-prod
+PROD_INPUT_BUCKET = my-input-bucket-prod
+PROD_OUTPUT_BUCKET = my-output-bucket-prod
+```
+
+## Step 10: Set up AWS Lambda Environment Variables
+
+In AWS Lambda console, set environment variables for each function:
+
+**Development Lambda:**
+```
+INPUT_BUCKET = my-input-bucket-dev
+OUTPUT_BUCKET = my-output-bucket-dev
+ENVIRONMENT = development
+LOG_LEVEL = DEBUG
+```
+
+**Production Lambda:**
+```
+INPUT_BUCKET = my-input-bucket-prod
+OUTPUT_BUCKET = my-output-bucket-prod
+ENVIRONMENT = production
+LOG_LEVEL = INFO
+```
+
+## Step 11: Local Development Workflow
+
+1. **Initial setup:**
+```bash
+# Clone the repo
+git clone your-repo-url
+cd my-lambda-project
+
+# Set up virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+pip install -r dev-requirements.txt
+```
+
+2. **Local development cycle:**
+```bash
+# Make code changes
+# Test locally
+python lambda_function.py
+
+# Run tests
+pytest tests/
+
+# Format code
+black .
+
+# Commit and push
+git add .
+git commit -m "Your changes"
+git push origin develop  # Will trigger CI/CD pipeline
+```
+
+## Step 12: Deployment Workflow
+
+1. **Development deployment:** Push to `develop` branch - automatically deploys to dev Lambda
+2. **Production deployment:** 
+   - Create PR from `develop` to `main`
+   - Merge PR
+   - Manually trigger production deployment in GitLab
+
+## Step 13: Monitoring and Debugging
+
+Add this to your Lambda function for better logging:
+
+**Enhanced logging in lambda_function.py:**
+```python
+import json
+import logging
+import traceback
+from config import Config
+from data_processor import process_data
+
+# Set up logging for Lambda
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def lambda_handler(event, context):
+    """AWS Lambda handler function"""
+    try:
+        logger.info(f"Lambda invoked with event: {json.dumps(event)}")
+        
+        config = Config()
+        logger.info(f"Environment: {config.environment}")
+        
+        result = process_data(config)
+        
+        response = {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Processing completed successfully',
+                'result': result
+            })
+        }
+        
+        logger.info(f"Lambda completed successfully: {json.dumps(response)}")
+        return response
+        
+    except Exception as e:
+        error_msg = f"Lambda execution failed: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'message': 'Processing failed',
+                'error': str(e)
+            })
+        }
+```
+
+This setup gives you:
+- ✅ Environment-specific configuration
+- ✅ Seamless local-to-Lambda development
+- ✅ Automated testing and deployment
+- ✅ Code quality checks
+- ✅ Multiple environment support (dev/prod)
+- ✅ Comprehensive logging
+- ✅ Easy debugging and monitoring
+
+The workflow becomes: develop locally → test locally → push to develop branch → automatic dev deployment → create PR to main → manual prod deployment.​​​​​​​​​​​​​​​​
